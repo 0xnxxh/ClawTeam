@@ -87,6 +87,22 @@ def test_spawn_cli_rejects_removed_acpx_backend(monkeypatch, tmp_path):
     assert "Unknown spawn backend: acpx. Available: subprocess, tmux" in result.output
 
 
+def test_spawn_cli_invalid_backend_hint_mentions_team_flag(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAWTEAM_DATA_DIR", str(tmp_path))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["spawn", "demo-team", "claude", "--agent-name", "alice", "--no-workspace"],
+        env={"CLAWTEAM_DATA_DIR": str(tmp_path)},
+    )
+
+    assert result.exit_code == 1
+    assert "the first" in result.output
+    assert "positional argument to `clawteam spawn` is the backend" in result.output
+    assert "--team <name>" in result.output
+
+
 def test_launch_cli_rejects_removed_acpx_backend(monkeypatch, tmp_path):
     monkeypatch.setenv("CLAWTEAM_DATA_DIR", str(tmp_path))
     monkeypatch.chdir(tmp_path)
@@ -141,6 +157,152 @@ def test_spawn_cli_applies_profile_command_and_env(monkeypatch, tmp_path):
     assert call["command"] == ["kimi", "--model", "kimi-k2-thinking-turbo", "--config-file", "/tmp/kimi.toml"]
     assert call["env"]["KIMI_BASE_URL"] == "https://api.moonshot.cn/v1"
     assert call["env"]["KIMI_API_KEY"] == "moonshot-secret"
+
+
+def test_spawn_cli_uses_configured_default_profile_when_no_profile_or_command(monkeypatch, tmp_path):
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-secret")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CLAWTEAM_DATA_DIR", str(tmp_path / ".clawteam"))
+    from clawteam.config import AgentProfile, ClawTeamConfig, save_config
+
+    save_config(
+        ClawTeamConfig(
+            default_profile="gemini-main",
+            profiles={
+                "gemini-main": AgentProfile(
+                    agent="gemini",
+                    model="gemini-2.5-pro",
+                    api_key_env="GEMINI_API_KEY",
+                )
+            },
+        )
+    )
+    TeamManager.create_team(
+        name="demo",
+        leader_name="leader",
+        leader_id="leader001",
+    )
+    backend = RecordingBackend()
+    monkeypatch.setattr("clawteam.spawn.get_backend", lambda _: backend)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["spawn", "subprocess", "--team", "demo", "--agent-name", "alice", "--no-workspace", "--task", "say hi"],
+        env={"HOME": str(tmp_path), "CLAWTEAM_DATA_DIR": str(tmp_path / ".clawteam"), "GEMINI_API_KEY": "gemini-secret"},
+    )
+
+    assert result.exit_code == 0
+    call = backend.calls[0]
+    assert call["command"] == ["gemini", "--model", "gemini-2.5-pro"]
+    assert call["env"]["GEMINI_API_KEY"] == "gemini-secret"
+
+
+def test_spawn_cli_uses_single_profile_implicitly(monkeypatch, tmp_path):
+    monkeypatch.setenv("MOONSHOT_API_KEY", "moonshot-secret")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CLAWTEAM_DATA_DIR", str(tmp_path / ".clawteam"))
+    from clawteam.config import AgentProfile, ClawTeamConfig, save_config
+
+    save_config(
+        ClawTeamConfig(
+            profiles={
+                "moonshot-kimi": AgentProfile(
+                    agent="kimi",
+                    model="kimi-k2-thinking-turbo",
+                    api_key_env="MOONSHOT_API_KEY",
+                )
+            }
+        )
+    )
+    TeamManager.create_team(
+        name="demo",
+        leader_name="leader",
+        leader_id="leader001",
+    )
+    backend = RecordingBackend()
+    monkeypatch.setattr("clawteam.spawn.get_backend", lambda _: backend)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["spawn", "subprocess", "--team", "demo", "--agent-name", "alice", "--no-workspace", "--task", "say hi"],
+        env={"HOME": str(tmp_path), "CLAWTEAM_DATA_DIR": str(tmp_path / ".clawteam"), "MOONSHOT_API_KEY": "moonshot-secret"},
+    )
+
+    assert result.exit_code == 0
+    call = backend.calls[0]
+    assert call["command"] == ["kimi", "--model", "kimi-k2-thinking-turbo"]
+    assert call["env"]["KIMI_API_KEY"] == "moonshot-secret"
+
+
+def test_spawn_cli_loads_skills_into_system_prompt(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAWTEAM_DATA_DIR", str(tmp_path / ".clawteam"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    TeamManager.create_team(
+        name="demo",
+        leader_name="leader",
+        leader_id="leader001",
+    )
+    backend = RecordingBackend()
+    monkeypatch.setattr("clawteam.spawn.get_backend", lambda _: backend)
+
+    skills_root = tmp_path / ".claude" / "skills"
+    skill_dir = skills_root / "reviewer"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("Always review carefully.", encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "spawn",
+            "subprocess",
+            "claude",
+            "--team",
+            "demo",
+            "--agent-name",
+            "alice",
+            "--no-workspace",
+            "--skill",
+            "reviewer",
+        ],
+        env={"HOME": str(tmp_path), "CLAWTEAM_DATA_DIR": str(tmp_path / ".clawteam")},
+    )
+
+    assert result.exit_code == 0
+    call = backend.calls[0]
+    assert call["system_prompt"] == "Always review carefully."
+
+
+def test_spawn_cli_errors_when_multiple_profiles_exist_without_default(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CLAWTEAM_DATA_DIR", str(tmp_path / ".clawteam"))
+    from clawteam.config import AgentProfile, ClawTeamConfig, save_config
+
+    save_config(
+        ClawTeamConfig(
+            profiles={
+                "profile-a": AgentProfile(agent="claude"),
+                "profile-b": AgentProfile(agent="gemini"),
+            }
+        )
+    )
+    TeamManager.create_team(
+        name="demo",
+        leader_name="leader",
+        leader_id="leader001",
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["spawn", "subprocess", "--team", "demo", "--agent-name", "alice", "--no-workspace"],
+        env={"HOME": str(tmp_path), "CLAWTEAM_DATA_DIR": str(tmp_path / ".clawteam")},
+    )
+
+    assert result.exit_code == 1
+    assert "Multiple profiles are configured" in result.output
 
 
 def test_launch_cli_applies_profile_to_template_agents(monkeypatch, tmp_path):
@@ -208,6 +370,36 @@ def test_spawn_cli_auto_creates_team_for_orchestrator(monkeypatch, tmp_path):
     assert team is not None
     assert team.members[0].name == "leader"
     assert team.members[0].agent_type == "orchestrator"
+
+
+def test_spawn_cli_auto_creates_team_for_general_purpose_agent(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAWTEAM_DATA_DIR", str(tmp_path))
+    backend = RecordingBackend()
+    monkeypatch.setattr("clawteam.spawn.get_backend", lambda _: backend)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "spawn",
+            "tmux",
+            "claude",
+            "--team",
+            "auto-team",
+            "--agent-name",
+            "worker",
+            "--no-workspace",
+            "--task",
+            "Hello",
+        ],
+        env={"CLAWTEAM_DATA_DIR": str(tmp_path)},
+    )
+
+    assert result.exit_code == 0
+    team = TeamManager.get_team("auto-team")
+    assert team is not None
+    assert team.members[0].name == "worker"
+    assert team.members[0].agent_type == "general-purpose"
 
 
 def test_spawn_cli_rolls_back_auto_created_team_on_spawn_error(monkeypatch, tmp_path):
